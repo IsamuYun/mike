@@ -79,3 +79,5 @@ as $$
     on rc.project_id = vp.id
   order by vp.created_at desc;
 $$;
+
+notify pgrst, 'reload schema';

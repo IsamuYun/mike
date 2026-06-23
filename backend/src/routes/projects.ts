@@ -20,6 +20,34 @@ import { deleteUserProjects } from "../lib/userDataCleanup";
 export const projectsRouter = Router();
 const ALLOWED_TYPES = new Set(["pdf", "docx", "doc"]);
 
+type Db = ReturnType<typeof createServerSupabase>;
+
+type ProjectOverviewRow = {
+  id: string;
+  user_id: string;
+  name: string;
+  cm_number: string | null;
+  shared_with: string[] | null;
+  created_at: string;
+  updated_at: string;
+  is_owner: boolean;
+  owner_display_name: string | null;
+  owner_email: string | null;
+  document_count: number;
+  chat_count: number;
+  review_count: number;
+};
+
+type ProjectBaseRow = Omit<
+  ProjectOverviewRow,
+  | "is_owner"
+  | "owner_display_name"
+  | "owner_email"
+  | "document_count"
+  | "chat_count"
+  | "review_count"
+>;
+
 function normalizeDocumentFilename(nextName: unknown, currentName: string) {
   if (typeof nextName !== "string") return null;
   const trimmed = nextName.trim().slice(0, 200);
@@ -136,17 +164,184 @@ async function attachChatCreatorLabels(
   }
 }
 
+function normalizeEmail(value: string | null | undefined) {
+  const email = value?.trim().toLowerCase();
+  return email || null;
+}
+
+function isMissingProjectsOverviewRpcError(
+  error: {
+    code?: string;
+    message?: string;
+  } | null,
+) {
+  if (!error) return false;
+  return (
+    error.code === "PGRST202" ||
+    (error.message ?? "").includes(
+      "Could not find the function public.get_projects_overview",
+    )
+  );
+}
+
+function throwQueryError(
+  error: { message?: string } | null,
+  fallbackMessage: string,
+) {
+  if (error) throw new Error(error.message || fallbackMessage);
+}
+
+function countByProjectId(rows: { project_id?: string | null }[]) {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    if (!row.project_id) continue;
+    counts.set(row.project_id, (counts.get(row.project_id) ?? 0) + 1);
+  }
+  return counts;
+}
+
+async function loadProjectsOverviewFallback(
+  db: Db,
+  userId: string,
+  userEmail: string | null,
+): Promise<ProjectOverviewRow[]> {
+  const projectColumns =
+    "id, user_id, name, cm_number, shared_with, created_at, updated_at";
+  const { data: ownedProjects, error: ownedProjectsError } = await db
+    .from("projects")
+    .select(projectColumns)
+    .eq("user_id", userId);
+  throwQueryError(ownedProjectsError, "Failed to load projects");
+
+  let sharedProjects: unknown[] = [];
+  if (userEmail) {
+    const { data, error } = await db
+      .from("projects")
+      .select(projectColumns)
+      .filter("shared_with", "cs", JSON.stringify([userEmail]))
+      .neq("user_id", userId);
+    throwQueryError(error, "Failed to load shared projects");
+    sharedProjects = data ?? [];
+  }
+
+  const projectsById = new Map<string, ProjectBaseRow>();
+  for (const project of [
+    ...(ownedProjects ?? []),
+    ...sharedProjects,
+  ] as ProjectBaseRow[]) {
+    projectsById.set(project.id, project);
+  }
+  const projects = [...projectsById.values()];
+  const projectIds = projects.map((project) => project.id);
+  const ownerIds = projects
+    .map((project) => project.user_id)
+    .filter((id, index, ids) => id && ids.indexOf(id) === index);
+
+  const documentCounts = new Map<string, number>();
+  const chatCounts = new Map<string, number>();
+  const reviewCounts = new Map<string, number>();
+  const displayNameByUserId = new Map<string, string>();
+
+  if (projectIds.length > 0) {
+    const [documents, chats, reviews, profiles] = await Promise.all([
+      db.from("documents").select("project_id").in("project_id", projectIds),
+      db.from("chats").select("project_id").in("project_id", projectIds),
+      db
+        .from("tabular_reviews")
+        .select("project_id")
+        .in("project_id", projectIds),
+      ownerIds.length > 0
+        ? db
+            .from("user_profiles")
+            .select("user_id, display_name")
+            .in("user_id", ownerIds)
+        : Promise.resolve({ data: [], error: null }),
+    ]);
+
+    throwQueryError(documents.error, "Failed to count project documents");
+    throwQueryError(chats.error, "Failed to count project chats");
+    throwQueryError(reviews.error, "Failed to count project reviews");
+    throwQueryError(profiles.error, "Failed to load project owners");
+
+    for (const [projectId, count] of countByProjectId(
+      (documents.data ?? []) as { project_id?: string | null }[],
+    )) {
+      documentCounts.set(projectId, count);
+    }
+    for (const [projectId, count] of countByProjectId(
+      (chats.data ?? []) as { project_id?: string | null }[],
+    )) {
+      chatCounts.set(projectId, count);
+    }
+    for (const [projectId, count] of countByProjectId(
+      (reviews.data ?? []) as { project_id?: string | null }[],
+    )) {
+      reviewCounts.set(projectId, count);
+    }
+
+    for (const profile of (profiles.data ?? []) as {
+      user_id?: string | null;
+      display_name?: string | null;
+    }[]) {
+      const displayName = profile.display_name?.trim();
+      if (profile.user_id && displayName) {
+        displayNameByUserId.set(profile.user_id, displayName);
+      }
+    }
+  }
+
+  return projects
+    .map((project) => ({
+      ...project,
+      shared_with: Array.isArray(project.shared_with)
+        ? project.shared_with
+        : [],
+      is_owner: project.user_id === userId,
+      owner_display_name: displayNameByUserId.get(project.user_id) ?? null,
+      owner_email: null,
+      document_count: documentCounts.get(project.id) ?? 0,
+      chat_count: chatCounts.get(project.id) ?? 0,
+      review_count: reviewCounts.get(project.id) ?? 0,
+    }))
+    .sort(
+      (a, b) =>
+        new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+    );
+}
+
 // GET /projects
 projectsRouter.get("/", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string | undefined;
+  const normalizedUserEmail = normalizeEmail(userEmail);
   const db = createServerSupabase();
 
   const { data, error } = await db.rpc("get_projects_overview", {
     p_user_id: userId,
-    p_user_email: userEmail ?? null,
+    p_user_email: normalizedUserEmail,
   });
-  if (error) return void res.status(500).json({ detail: error.message });
+  if (error) {
+    if (isMissingProjectsOverviewRpcError(error)) {
+      console.warn(
+        "[projects] get_projects_overview RPC missing from schema cache; using fallback query",
+      );
+      try {
+        const fallbackData = await loadProjectsOverviewFallback(
+          db,
+          userId,
+          normalizedUserEmail,
+        );
+        return void res.json(fallbackData);
+      } catch (fallbackError) {
+        const detail =
+          fallbackError instanceof Error
+            ? fallbackError.message
+            : String(fallbackError);
+        return void res.status(500).json({ detail });
+      }
+    }
+    return void res.status(500).json({ detail: error.message });
+  }
 
   res.json(data ?? []);
 });
